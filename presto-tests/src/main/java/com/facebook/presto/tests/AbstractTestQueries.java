@@ -47,6 +47,7 @@ import java.sql.Timestamp;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.IntStream;
 
 import static com.facebook.presto.connector.informationSchema.InformationSchemaMetadata.INFORMATION_SCHEMA;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
@@ -75,8 +76,8 @@ import static com.google.common.collect.Iterables.transform;
 import static io.airlift.tpch.TpchTable.ORDERS;
 import static io.airlift.tpch.TpchTable.tableNameGetter;
 import static java.lang.String.format;
-import static java.util.Arrays.asList;
 import static java.util.stream.Collectors.joining;
+import static java.util.stream.Collectors.toList;
 import static java.util.stream.IntStream.range;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
@@ -3249,6 +3250,37 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testAggregationOverRigthJoinOverSingleStreamProbe()
+            throws Exception
+    {
+        // this should return one row since value is always 'value'
+        // this test verifies that the two streams produced by the right join
+        // are handled gathered for the aggergation operator
+        assertQueryOrdered("" +
+                "SELECT\n" +
+                "  value\n" +
+                "FROM\n" +
+                "(\n" +
+                "    SELECT\n" +
+                "        key\n" +
+                "    FROM\n" +
+                "        (VALUES 'match') as a(key)\n" +
+                "        LEFT JOIN (SELECT * FROM (VALUES (0)) limit 0) AS x(ignored)\n" +
+                "        ON TRUE\n" +
+                "    GROUP BY 1\n" +
+                ") a\n" +
+                "RIGHT JOIN\n" +
+                "(\n" +
+                "    VALUES\n" +
+                "    ('match', 'value'),\n" +
+                "    ('no-match', 'value')\n" +
+                ") AS b(key, value)\n" +
+                "ON a.key = b.key\n" +
+                "GROUP BY 1\n",
+                "VALUES 'value'");
+    }
+
+    @Test
     public void testOrderBy()
             throws Exception
     {
@@ -3740,6 +3772,28 @@ public abstract class AbstractTestQueries
                 .row(32L, 8L)
                 .row(7L, 7L)
                 .row(6L, 6L)
+                .build();
+
+        assertEquals(actual, expected);
+    }
+
+    @Test
+    public void testSameWindowFunctionsTwoCoerces()
+            throws Exception
+    {
+        MaterializedResult actual = computeActual("" +
+                "SELECT 12.0 * row_number() OVER ()/row_number() OVER(),\n" +
+                "row_number() OVER()\n" +
+                "FROM (SELECT * FROM orders ORDER BY orderkey LIMIT 10)\n" +
+                "ORDER BY 2 DESC\n" +
+                "LIMIT 5");
+
+        MaterializedResult expected = resultBuilder(getSession(), BIGINT, BIGINT)
+                .row(12.0, 10L)
+                .row(12.0, 9L)
+                .row(12.0, 8L)
+                .row(12.0, 7L)
+                .row(12.0, 6L)
                 .build();
 
         assertEquals(actual, expected);
@@ -7067,19 +7121,25 @@ public abstract class AbstractTestQueries
     public void testArrayShuffle()
             throws Exception
     {
-        List<Integer> expected = asList(2, 8, 7, 5, 4, 6, 3);
-        Set<List<Integer>> resultSet = new HashSet<>();
+        List<Integer> expected = IntStream.rangeClosed(1, 500).boxed().collect(toList());
+        Set<List<Integer>> distinctResults = new HashSet<>();
 
-        resultSet.add(expected);
-        for (int i = 0; i < 10; i++) {
-            List<Integer> result = (List<Integer>) computeActual("SELECT shuffle(array[2, 8, 7, 5, 4, 6, 3])").getOnlyValue();
+        distinctResults.add(expected);
+        for (int i = 0; i < 3; i++) {
+            MaterializedResult results = computeActual(format("SELECT shuffle(ARRAY %s) from orders limit 10", expected));
+            List<MaterializedRow> rows = results.getMaterializedRows();
+            assertTrue(rows.size() == 10);
 
-            // check if the result is a correct permutation
-            assertEqualsIgnoreOrder(result, expected);
+            for (MaterializedRow row : rows) {
+                List<Integer> actual = (List<Integer>) row.getField(0);
 
-            // check if there is any duplicated result
-            assertTrue(resultSet.add(result));
+                // check if the result is a correct permutation
+                assertEqualsIgnoreOrder(actual, expected);
+
+                distinctResults.add(actual);
+            }
         }
+        assertTrue(distinctResults.size() >= 24, "shuffle must produce at least 24 distinct results");
     }
 
     @Test
@@ -7599,6 +7659,13 @@ public abstract class AbstractTestQueries
         assertAccessDenied("INSERT INTO orders SELECT * FROM orders", "Cannot insert into table .*.orders.*", privilege("orders", INSERT_TABLE));
         assertAccessDenied("DELETE FROM orders", "Cannot delete from table .*.orders.*", privilege("orders", DELETE_TABLE));
         assertAccessDenied("CREATE TABLE foo AS SELECT * FROM orders", "Cannot create table .*.foo.*", privilege("foo", CREATE_TABLE));
+    }
+
+    @Test
+    public void testEmptyInputForUnnest()
+            throws Exception
+    {
+        assertQuery("select val from (select distinct vals from (values (array[2])) t(vals) where false) tmp cross join unnest(tmp.vals) tt(val)", "select 1 where 1=2");
     }
 
     @Test
